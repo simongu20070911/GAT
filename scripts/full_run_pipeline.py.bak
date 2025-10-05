@@ -1,0 +1,184 @@
+"""Batch controller for full candlestick pipeline across symbols/months."""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+
+import pandas as pd
+
+from candlestrats.bars import DecisionBarConfig
+from candlestrats.data import MinuteBarStore
+from candlestrats.data.ingestion import BinanceIngestionSpec
+from candlestrats.labeling import TripleBarrierConfig
+from candlestrats.pipeline import PipelineConfig, run_pipeline
+from candlestrats.features.motifs import MotifSpec
+from candlestrats.motifs import mine_motifs_from_bars, motifs_to_frame
+from candlestrats.gp import GeneticProgramConfig, GeneticProgramMiner
+from candlestrats.evaluation import CombinatorialPurgedCV, FeeModel
+from candlestrats.gp.evaluation import StrategyEvaluator
+from candlestrats.cluster.embeddings import PatternStats, build_feature_matrix
+
+OUTPUT_ROOT = Path("/mnt/timemachine/binance/features/full_run")
+MONTHLY_ROOT = Path("/mnt/timemachine/binance/futures/um/monthly/klines")
+
+
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BatchResult:
+    symbol: str
+    month: str
+    output_dir: Path
+    motifs_count: int
+    gp_rules: int
+
+
+def list_symbols(limit: int | None = None) -> list[str]:
+    symbols = sorted([p.name for p in MONTHLY_ROOT.iterdir() if p.is_dir()])
+    return symbols[:limit] if limit else symbols
+
+
+def load_monthly_data(symbol: str, month: str) -> pd.DataFrame:
+    csv_path = MONTHLY_ROOT / symbol / "1m" / f"{symbol}-1m-{month}.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Missing monthly CSV {csv_path}")
+    frame = pd.read_csv(csv_path)
+    frame["timestamp"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
+    return frame[["timestamp", "open", "high", "low", "close", "volume"]]
+
+
+def run_stage_pipeline(symbol: str, month: str, frame: pd.DataFrame, output_root: Path) -> BatchResult:
+    output_dir = output_root / symbol / month
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    spec = BinanceIngestionSpec(symbol=symbol)
+    spec.raw_path = lambda frame=frame: frame  # type: ignore[attr-defined]
+
+    class InMemoryStore(MinuteBarStore):
+        def __init__(self, symbol: str, frame: pd.DataFrame) -> None:
+            spec = BinanceIngestionSpec(symbol=symbol)
+            spec.raw_path = lambda: "<in-memory>"
+            super().__init__([spec])
+            self._frame = frame
+
+        def load(self, symbol: str, start=None, end=None) -> pd.DataFrame:  # type: ignore[override]
+            data = self._frame.copy()
+            if start:
+                data = data[data["timestamp"] >= pd.Timestamp(start).tz_convert("UTC")]
+            if end:
+                data = data[data["timestamp"] <= pd.Timestamp(end).tz_convert("UTC")]
+            return data.reset_index(drop=True)
+
+    store = InMemoryStore(symbol, frame)
+    pipeline_config = PipelineConfig(
+        symbol=symbol,
+        bar=DecisionBarConfig(),
+        triple_barrier=TripleBarrierConfig(),
+        motif=MotifSpec(window=24, n_clusters=8),
+    )
+    result = run_pipeline(store, pipeline_config)
+
+    bars_path = output_dir / f"{symbol}_decision_bars.parquet"
+    labels_path = output_dir / f"{symbol}_labels.parquet"
+    features_path = output_dir / f"{symbol}_features.parquet"
+    result.decision_bars.to_parquet(bars_path)
+    result.labels.to_parquet(labels_path)
+    result.features.to_parquet(features_path)
+
+    motifs = mine_motifs_from_bars(
+        result.decision_bars,
+        result.labels.set_index("bar_id")["y"],
+        spec_config=Path("config/research/predicate_specs.yaml"),
+        min_support=0.05,
+        min_lift=0.9,
+        max_size=2,
+    )
+    motifs_frame = motifs_to_frame(motifs)
+    motifs_frame["symbol"] = symbol
+    motifs_frame.to_csv(output_dir / f"motifs_{symbol}_{month}.csv", index=False)
+
+    feature_cols = [col for col in result.features.columns if col != "timestamp"]
+    feature_df = result.features[feature_cols]
+    labels_series = result.labels.set_index("bar_id")["y"]
+
+    gp_config = GeneticProgramConfig(
+        population_size=16,
+        n_generations=4,
+        feature_columns=tuple(feature_cols),
+        turnover_weight=0.5,
+        breadth_weight=1.0,
+    )
+    cv = CombinatorialPurgedCV(n_splits=3, embargo_minutes=2)
+    evaluator = StrategyEvaluator(cv=cv, fee_model=FeeModel())
+    miner = GeneticProgramMiner(gp_config, strategy_evaluator=evaluator)
+    population = miner.evaluate(miner.seed_population(), feature_df, labels_series)
+
+    stats = []
+    for idx, rule in enumerate(population):
+        meta = rule.metadata or {}
+        metrics = {k: float(v) for k, v in meta.items() if isinstance(v, (int, float)) and not pd.isna(v)}
+        stats.append(PatternStats(name=f"{symbol}_{month}_rule_{idx}", items=tuple(meta.keys()), metrics=metrics))
+
+    gp_matrix = build_feature_matrix(stats)
+    gp_matrix.to_csv(output_dir / f"gp_matrix_{symbol}_{month}.csv")
+
+    (output_dir / "_SUCCESS").write_text("\n")
+
+    return BatchResult(
+        symbol=symbol,
+        month=month,
+        output_dir=output_dir,
+        motifs_count=len(motifs_frame),
+        gp_rules=len(gp_matrix),
+    )
+
+
+def process_batch(symbols: Sequence[str], months: Sequence[str], output_root: Path) -> list[BatchResult]:
+    results: list[BatchResult] = []
+    for symbol in symbols:
+        for month in months:
+            output_dir = output_root / symbol / month
+            marker = output_dir / "_SUCCESS"
+            if marker.exists():
+                logger.info("Skipping %s %s (already completed)", symbol, month)
+                continue
+            logger.info("Processing %s %s", symbol, month)
+            frame = load_monthly_data(symbol, month)
+            result = run_stage_pipeline(symbol, month, frame, output_root)
+            logger.info("Completed %s %s motifs=%d rules=%d", symbol, month, result.motifs_count, result.gp_rules)
+            results.append(result)
+    return results
+
+
+def chunked(iterable: Sequence[str], size: int) -> Iterable[Sequence[str]]:
+    for i in range(0, len(iterable), size):
+        yield iterable[i : i + size]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Full run batch pipeline")
+    parser.add_argument("--symbols", nargs="*", help="Symbols to process (default autodetect)")
+    parser.add_argument("--months", nargs="*", required=True, help="Months YYYY-MM")
+    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    symbols = args.symbols if args.symbols else list_symbols()
+    months = args.months
+    for batch in chunked(symbols, args.batch_size):
+        logger.info("Starting batch %s", ",".join(batch))
+        process_batch(batch, months, args.output_root)
+        logger.info("Batch complete")
+
+
+if __name__ == "__main__":
+    main()

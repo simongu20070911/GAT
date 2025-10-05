@@ -1,0 +1,8 @@
+venues:
+  binance:
+    futures_usdm:
+      vip0:
+        maker_bps: -0.1
+        taker_bps: 4.0
+        half_spread_bps: 1.0
+        impact_perc_coeff: 0.0

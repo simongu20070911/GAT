@@ -1,0 +1,3 @@
+default_tier: vip0
+overrides:
+  BTCUSDT: vip0

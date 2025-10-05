@@ -1,0 +1,96 @@
+default:
+- name: LONG_LOWER_WICK
+  params:
+    kind: lower
+    threshold: 0.35
+- name: WICK_DOMINANCE
+  params:
+    kind: upper
+    ratio: 1.5
+- name: RANGE_COMPRESSION
+  params:
+    window: 5
+    quantile: 0.2
+- name: VOLUME_SPIKE
+  params:
+    window: 30
+    quantile: 0.8
+- name: BREAK_ABOVE_RANGE
+  params:
+    lookback: 20
+    eps: 0.0
+- name: BREAK_BELOW_RANGE
+  params:
+    lookback: 20
+    eps: 0.0
+- name: INSIDE_BAR
+- name: OUTSIDE_BAR
+- name: BULLISH_ENGULF
+- name: BEARISH_ENGULF
+- name: EVR_ANOMALY
+  params:
+    window: 20
+    threshold: 1.0
+- name: ROUND_LEVEL_PROXIMITY
+  params:
+    step: 0.01
+    tolerance: 0.25
+- name: PIVOT_HIGH
+  params:
+    left: 2
+    right: 2
+- name: PIVOT_LOW
+  params:
+    left: 2
+    right: 2
+- &id001
+  name: HIGHER_LOW
+  params:
+    depth: 3
+clusters:
+  trend_momentum:
+  - *id001
+  - name: RANGE_COMPRESSION
+    params:
+      window: 7
+      quantile: 0.25
+  - name: WICK_DOMINANCE
+    params:
+      kind: lower
+      ratio: 1.2
+  mean_reversion:
+  - name: LONG_LOWER_WICK
+    params:
+      kind: lower
+      threshold: 0.4
+  - name: EVR_ANOMALY
+    params:
+      window: 30
+      threshold: 1.2
+  - name: ROUND_LEVEL_PROXIMITY
+    params:
+      step: 0.005
+      tolerance: 0.2
+  breakout:
+  - name: BREAK_ABOVE_RANGE
+    params:
+      lookback: 30
+      eps: 0.0
+  - name: INSIDE_BAR
+  - name: VOLUME_SPIKE
+    params:
+      window: 40
+      quantile: 0.85
+  volatility_breakout:
+  - name: BREAK_ABOVE_RANGE
+    params:
+      lookback: 48
+      eps: 0.0
+  - name: VOLUME_SPIKE
+    params:
+      window: 60
+      quantile: 0.85
+  - name: PIVOT_HIGH
+    params:
+      left: 3
+      right: 1

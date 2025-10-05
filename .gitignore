@@ -1,0 +1,8 @@
+# Ignore local datasets and generated artifacts
+data/
+__pycache__/
+*/__pycache__/
+.pytest_cache/
+*.pyc
+logs/
+reports/stage_02_priors/
