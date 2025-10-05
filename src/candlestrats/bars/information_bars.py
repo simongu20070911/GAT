@@ -41,7 +41,7 @@ def _rolling_threshold(series: pd.Series, target_seconds: int, window_minutes: i
 
 def _construct_time_bars(ohlcv: pd.DataFrame, target_seconds: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
     freq = f"{max(target_seconds // 60, 1)}min"
-    resampled = ohlcv.resample(freq, on="timestamp").agg(
+    resampled = ohlcv.resample(freq, on="timestamp", label="right", closed="right").agg(
         {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
     )
     resampled = (
@@ -56,7 +56,7 @@ def _construct_time_bars(ohlcv: pd.DataFrame, target_seconds: int) -> Tuple[pd.D
         ohlcv[["timestamp"]].sort_values("timestamp"),
         bars[["ts", "bar_id"]].rename(columns={"ts": "timestamp"}).sort_values("timestamp"),
         on="timestamp",
-        direction="backward",
+        direction="forward",
         allow_exact_matches=True,
     ).dropna()
     return bars, mapping

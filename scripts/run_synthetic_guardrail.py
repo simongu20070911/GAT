@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,10 +16,10 @@ import pandas as pd
 from candlestrats.bars import DecisionBarConfig
 from candlestrats.data import MinuteBarStore
 from candlestrats.data.ingestion import BinanceIngestionSpec
-from candlestrats.evaluation import CombinatorialPurgedCV, FeeModel
+from candlestrats.evaluation import CombinatorialPurgedCV, FeeModel, resolve_fee_model
 from candlestrats.features.motifs import MotifSpec
 from candlestrats.gp import GeneticProgramConfig, GeneticProgramMiner
-from candlestrats.gp.evaluation import StrategyEvaluator
+from candlestrats.gp.evaluation import EvaluationResult, StrategyEvaluator
 from candlestrats.gp.miner import CandidateRule
 from candlestrats.labeling import TripleBarrierConfig
 from candlestrats.pipeline import PipelineConfig, run_pipeline
@@ -48,7 +49,22 @@ class GuardrailConfig:
     hits_required: int = DEFAULT_HITS
 
 
-def load_monthly_data(symbol: str, month: str) -> pd.DataFrame:
+MONTH_PATTERN = re.compile(r"^\d{4}-\d{2}$")
+WINDOW_PATTERN = re.compile(r"(\d{4}-\d{2})_to_(\d{4}-\d{2})")
+
+
+def _months_between(start: str, end: str) -> list[str]:
+    start_dt = pd.Timestamp(start)
+    end_dt = pd.Timestamp(end)
+    months = []
+    current = start_dt
+    while current <= end_dt:
+        months.append(current.strftime("%Y-%m"))
+        current += pd.offsets.MonthBegin(1)
+    return months
+
+
+def _load_single_month(symbol: str, month: str) -> pd.DataFrame:
     csv_path = MONTHLY_ROOT / symbol / "1m" / f"{symbol}-1m-{month}.csv"
     if not csv_path.exists():
         raise FileNotFoundError(f"Missing monthly CSV {csv_path}")
@@ -81,6 +97,30 @@ def load_monthly_data(symbol: str, month: str) -> pd.DataFrame:
     frame = frame.dropna(subset=["timestamp"])
     frame = frame.dropna(subset=numeric_cols)
     return frame[["timestamp", "open", "high", "low", "close", "volume"]]
+
+
+def load_symbol_data(symbol: str, label: str) -> pd.DataFrame:
+    label = str(label)
+    if MONTH_PATTERN.match(label):
+        return _load_single_month(symbol, label)
+    match = WINDOW_PATTERN.search(label)
+    if match:
+        start, end = match.groups()
+        frames = []
+        for month in _months_between(start, end):
+            try:
+                frames.append(_load_single_month(symbol, month))
+            except FileNotFoundError:
+                continue
+        if not frames:
+            raise FileNotFoundError(f"No data found for {symbol} {label}")
+        combined = pd.concat(frames, ignore_index=True).drop_duplicates(subset="timestamp")
+        combined = combined.sort_values("timestamp").reset_index(drop=True)
+        return combined
+    raise FileNotFoundError(f"Unrecognized label {label}")
+
+
+
 
 
 class InMemoryStore(MinuteBarStore):
@@ -147,32 +187,70 @@ def guardrail_for_symbol(symbol: str, month: str, summary_path: Path, cfg: Guard
         summary_path.write_text(json.dumps(summary, indent=2, allow_nan=False))
         return {"skipped": True, "reason": "missing_expression"}
 
-    frame = load_monthly_data(symbol, month)
-    store = InMemoryStore(symbol, frame)
     pipeline_config = PipelineConfig(
         symbol=symbol,
         bar=DecisionBarConfig(),
         triple_barrier=TripleBarrierConfig(),
         motif=MotifSpec(window=24, n_clusters=8),
     )
-    result = run_pipeline(store, pipeline_config)
-    feature_ts = pd.to_datetime(result.features.get("ts"), utc=True)
-    feature_cols = [col for col in result.features.columns if col != "ts"]
-    features = (
-        result.features.drop(columns=["ts"], errors="ignore")
-        .reindex(columns=feature_cols)
-    )
+    features_raw: pd.DataFrame | None = None
+    labels_raw: pd.DataFrame | None = None
+
+    use_artifacts = not MONTH_PATTERN.match(month)
+    if use_artifacts:
+        base_dir = summary_path.parent
+        features_path = base_dir / f"{symbol}_features.parquet"
+        labels_path = base_dir / f"{symbol}_labels.parquet"
+        if features_path.exists() and labels_path.exists():
+            features_raw = pd.read_parquet(features_path)
+            labels_raw = pd.read_parquet(labels_path)
+        else:
+            use_artifacts = False
+
+    if not use_artifacts:
+        frame = load_symbol_data(symbol, month)
+        store = InMemoryStore(symbol, frame)
+        result = run_pipeline(store, pipeline_config)
+        features_raw = result.features
+        labels_raw = result.labels
+
+    assert features_raw is not None and labels_raw is not None
+
+    feature_ts = pd.to_datetime(features_raw.get("ts"), utc=True)
+    features = features_raw.drop(columns=["ts"], errors="ignore")
     features.index = feature_ts
     features.index.name = "ts"
-    label_ts = pd.to_datetime(result.labels.get("ts"), utc=True)
-    label_frame = result.labels.set_index(label_ts, drop=False)
+
+    label_ts_series = labels_raw.get("ts")
+    if label_ts_series is None:
+        label_ts_series = labels_raw.get("timestamp")
+    label_ts = pd.to_datetime(label_ts_series, utc=True)
+    label_frame = labels_raw.set_index(label_ts, drop=False)
     label_frame.index.name = "ts"
-    features = features.reindex(label_frame.index).fillna(0.0)
+
+    features, label_frame = features.align(label_frame, join="inner", axis=0)
+    feature_cols = list(features.columns)
+
+    try:
+        fee_model, _ = resolve_fee_model("binance", "futures_usdm", symbol=symbol)
+    except Exception:  # pragma: no cover - defensive fallback
+        fee_model = FeeModel()
+
+    embargo_minutes = 720
+
+    match = re.search(r"pop(\d+)_gen(\d+)", month)
+    trials = None
+    if match:
+        try:
+            trials = int(match.group(1)) * int(match.group(2))
+        except ValueError:
+            trials = None
 
     evaluator = StrategyEvaluator(
-        cv=CombinatorialPurgedCV(n_splits=3, embargo_minutes=2),
-        fee_model=FeeModel(),
+        cv=CombinatorialPurgedCV(n_splits=3, embargo_minutes=embargo_minutes),
+        fee_model=fee_model,
         min_trades=cfg.min_trades,
+        trials=trials,
     )
 
     real_signal = evaluate_expression(expression, features)
@@ -182,16 +260,29 @@ def guardrail_for_symbol(symbol: str, month: str, summary_path: Path, cfg: Guard
         summary["post_guard_checked_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         summary_path.write_text(json.dumps(summary, indent=2, allow_nan=False))
         return {"skipped": True, "reason": "insufficient_real_trades"}
-    real_fitness = real_eval.dsr
+    turnover_weight = 0.5
+    breadth_weight = 1.0
+
+    def _composite(result: EvaluationResult) -> float:
+        score = result.dsr
+        if np.isnan(score):
+            return float("-inf")
+        score -= turnover_weight * float(result.turnover)
+        score += breadth_weight * float(result.breadth)
+        score -= float(result.pbo)
+        return score
+
+    real_fitness = _composite(real_eval)
 
     synthetic_metrics: List[float] = []
     positive_metrics: List[float] = []
     hits = 0
 
     synthetic_rng = np.random.default_rng(42)
+    base_length = max(len(label_frame), 10)
 
     for _ in range(cfg.runs):
-        synthetic_length = max(len(frame), 10)
+        synthetic_length = base_length
         synthetic_frame = generate_random_walk_ohlcv(synthetic_length, random_state=synthetic_rng)
         if "timestamp" in synthetic_frame.columns and synthetic_frame["timestamp"].dt.tz is None:
             synthetic_frame["timestamp"] = synthetic_frame["timestamp"].dt.tz_localize("UTC")
@@ -208,21 +299,17 @@ def guardrail_for_symbol(symbol: str, month: str, summary_path: Path, cfg: Guard
         synthetic_label_ts = pd.to_datetime(synthetic_result.labels.get("ts"), utc=True)
         synthetic_label_frame = synthetic_result.labels.set_index(synthetic_label_ts, drop=False)
         synthetic_label_frame.index.name = "ts"
-        synthetic_features = synthetic_features.reindex(synthetic_label_frame.index).fillna(0.0)
+        synthetic_features, synthetic_label_frame = synthetic_features.align(synthetic_label_frame, join="inner", axis=0)
         synthetic_signal = evaluate_expression(expression, synthetic_features)
         syn_eval = evaluator.evaluate_signals(synthetic_signal, synthetic_label_frame)
-        metric = syn_eval.dsr
+        metric = _composite(syn_eval)
         if np.isnan(metric):
             metric = float("-inf")
         synthetic_metrics.append(metric)
-        if (
-            syn_eval.trade_count >= cfg.min_trades
-            and np.isfinite(metric)
-            and metric >= cfg.threshold
-            and real_fitness > 0
-        ):
+        if syn_eval.trade_count >= cfg.min_trades and np.isfinite(metric) and metric >= cfg.threshold and real_fitness > 0:
             ratio = metric / real_fitness
-            if ratio >= cfg.ratio_threshold:
+            trade_ratio = syn_eval.trade_count / max(real_eval.trade_count, 1)
+            if ratio >= cfg.ratio_threshold and trade_ratio <= 2.0:
                 hits += 1
                 positive_metrics.append(metric)
 
@@ -241,6 +328,7 @@ def guardrail_for_symbol(symbol: str, month: str, summary_path: Path, cfg: Guard
     summary["post_guard_passed"] = pass_guard
     summary["post_guard_checked_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     summary["post_guard_real_fitness"] = float(real_fitness)
+    summary["post_guard_real_dsr"] = _finite_or_none(real_eval.dsr)
     summary["post_guard_metrics"] = synthetic_metrics
 
     summary_path.write_text(json.dumps(summary, indent=2, allow_nan=False))

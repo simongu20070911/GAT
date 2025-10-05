@@ -104,7 +104,9 @@ def mine_motifs_from_bars(
     frame = frame.sort_index()
 
     predicate_table = evaluate_predicates(frame, predicates)
-    aligned_labels = labels.reindex(predicate_table.index).fillna(0)
+    label_index = pd.to_datetime(labels.index, utc=True, errors="coerce")
+    aligned_labels = pd.Series(labels.values, index=label_index)
+    aligned_labels = aligned_labels.reindex(predicate_table.index).fillna(0)
 
     miner = FrequentMotifMiner(min_support=min_support, min_lift=min_lift)
     motifs = miner.mine(predicate_table, aligned_labels, max_size=max_size)

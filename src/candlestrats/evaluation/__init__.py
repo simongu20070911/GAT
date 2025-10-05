@@ -1,6 +1,7 @@
 """Evaluation and validation utilities."""
 
 from .cpcv import CombinatorialPurgedCV, evaluate_strategy  # noqa: F401
+from .event_cv import PurgedEventKFold  # noqa: F401
 from .multiple_testing import (  # noqa: F401
     probabilistic_sharpe_ratio,
     deflated_sharpe_ratio,

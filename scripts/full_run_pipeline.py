@@ -184,7 +184,7 @@ def run_stage_pipeline(symbol: str, month: str, frame: pd.DataFrame, output_root
     label_ts = pd.to_datetime(result.labels.get("ts"), utc=True)
     label_frame = result.labels.set_index(label_ts, drop=False)
     label_frame.index.name = "ts"
-    feature_df = feature_df.reindex(label_frame.index).fillna(0.0)
+    feature_df, label_frame = feature_df.align(label_frame, join="inner", axis=0)
 
     gp_config = GeneticProgramConfig(
         population_size=population_size,
@@ -193,7 +193,7 @@ def run_stage_pipeline(symbol: str, month: str, frame: pd.DataFrame, output_root
         turnover_weight=0.5,
         breadth_weight=1.0,
     )
-    cv = CombinatorialPurgedCV(n_splits=3, embargo_minutes=2)
+    cv = CombinatorialPurgedCV(n_splits=3, embargo_minutes=720)
     gp_trials = max(gp_config.population_size * max(gp_config.n_generations, 1), 1)
     evaluator = StrategyEvaluator(
         cv=cv,
@@ -215,7 +215,7 @@ def run_stage_pipeline(symbol: str, month: str, frame: pd.DataFrame, output_root
 
     synthetic_rng = np.random.default_rng(SYNTHETIC_SEED)
 
-    synthetic_length = max(len(frame), 10)
+    synthetic_length = max(len(label_frame), 10)
     synthetic_frame = generate_random_walk_ohlcv(synthetic_length, random_state=synthetic_rng)
     if "timestamp" in synthetic_frame.columns:
         if synthetic_frame["timestamp"].dt.tz is None:
@@ -234,7 +234,7 @@ def run_stage_pipeline(symbol: str, month: str, frame: pd.DataFrame, output_root
     synthetic_label_ts = pd.to_datetime(synthetic_result.labels.get("ts"), utc=True)
     synthetic_labels = synthetic_result.labels.set_index(synthetic_label_ts, drop=False)
     synthetic_labels.index.name = "ts"
-    synthetic_features = synthetic_features.reindex(synthetic_labels.index).fillna(0.0)
+    synthetic_features, synthetic_labels = synthetic_features.align(synthetic_labels, join="inner", axis=0)
     synthetic_fits: dict[str, list[float]] = defaultdict(list)
     synthetic_trade_counts: dict[str, list[int]] = defaultdict(list)
     synthetic_meta: dict[str, dict[str, float]] = {}
@@ -254,7 +254,7 @@ def run_stage_pipeline(symbol: str, month: str, frame: pd.DataFrame, output_root
 
     # Additional synthetic runs to reduce false positives
     for _ in range(1, SYNTHETIC_RUNS):
-        synthetic_length = max(len(frame), 10)
+        synthetic_length = max(len(label_frame), 10)
         synthetic_frame_iter = generate_random_walk_ohlcv(synthetic_length, random_state=synthetic_rng)
         if "timestamp" in synthetic_frame_iter.columns and synthetic_frame_iter["timestamp"].dt.tz is None:
             synthetic_frame_iter["timestamp"] = synthetic_frame_iter["timestamp"].dt.tz_localize("UTC")
@@ -271,7 +271,7 @@ def run_stage_pipeline(symbol: str, month: str, frame: pd.DataFrame, output_root
         synth_iter_label_ts = pd.to_datetime(synthetic_result_iter.labels.get("ts"), utc=True)
         synthetic_labels_iter = synthetic_result_iter.labels.set_index(synth_iter_label_ts, drop=False)
         synthetic_labels_iter.index.name = "ts"
-        synthetic_features_iter = synthetic_features_iter.reindex(synthetic_labels_iter.index).fillna(0.0)
+        synthetic_features_iter, synthetic_labels_iter = synthetic_features_iter.align(synthetic_labels_iter, join="inner", axis=0)
         synthetic_rules_iter = [CandidateRule(expression=rule.expression) for rule in population]
         synthetic_population_iter = miner.evaluate(synthetic_rules_iter, synthetic_features_iter, synthetic_labels_iter)
         for real_rule, synth_rule in zip(population, synthetic_population_iter):
@@ -317,6 +317,7 @@ def run_stage_pipeline(symbol: str, month: str, frame: pd.DataFrame, output_root
                 if count >= EVALUATOR_MIN_TRADES
                 and fit >= SYNTHETIC_THRESHOLD
                 and (real_fit > 0 and fit / real_fit >= SYNTHETIC_RATIO)
+                and (real_trades > 0 and count / real_trades <= 2.0)
             ]
             hits = len(qualified_hits)
             if hits >= SYNTHETIC_HITS_REQUIRED and real_fit >= 0.5:
